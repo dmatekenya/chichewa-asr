@@ -5,6 +5,12 @@ __pycache__/
 # Data
 data/
 
+# Output files
+outputs/
+
+# Models
+models/
+
 # C extensions
 *.so
 

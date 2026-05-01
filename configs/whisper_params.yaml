@@ -1,0 +1,29 @@
+model:
+  model_name_or_path: openai/whisper-small
+  language: swahili
+  task: transcribe
+
+training:
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-5
+  warmup_steps: 5
+  max_steps: 20
+  gradient_checkpointing: false
+  fp16: false
+  predict_with_generate: true
+  generation_max_length: 225
+  save_strategy: steps
+  save_steps: 10
+  logging_steps: 5
+
+evaluation:
+  eval_strategy: steps
+  eval_steps: 10
+  load_best_model_at_end: true
+  metric_for_best_model: wer
+  greater_is_better: false
+
+hub:
+  push_to_hub: false
+  report_to: none

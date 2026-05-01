@@ -5,7 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "accelerate>=1.1.0",
     "chardet>=7.4.3",
+    "datasets>=4.8.5",
+    "evaluate>=0.4.6",
     "great-tables>=0.21.0",
     "jiwer>=4.0.0",
     "librosa>=0.11.0",
@@ -14,6 +17,8 @@ dependencies = [
     "pydub>=0.25.1",
     "python-dotenv>=1.2.2",
     "soundfile>=0.13.1",
+    "tensorboard>=2.20.0",
     "torch>=2.11.0",
+    "torchcodec>=0.11.1",
     "transformers>=5.4.0",
 ]
