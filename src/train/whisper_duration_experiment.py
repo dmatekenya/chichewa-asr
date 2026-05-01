@@ -222,7 +222,6 @@ def run_evaluation(
 
     results_df.to_csv(output_csv, index=False)
     
-    test_hours = sum(dataset_eval[duration_label]) / 3600
     print(f"  WER: {wer:.2f}%   CER: {cer:.2f}%")
     print(f"  Predictions saved: {output_csv}")
-    return {"wer": wer, "cer": cer, "test_hours": round(test_hours, 2), "predictions": results_df}
+    return {"wer": wer, "cer": cer, "predictions": results_df}
