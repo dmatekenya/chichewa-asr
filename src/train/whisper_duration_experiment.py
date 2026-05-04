@@ -38,7 +38,7 @@ from transformers import (
     WhisperProcessor,
 )
 
-from src.data.data_utils import load_audio_data
+from src.data_utils.data_utils import load_audio_data
 from src.train.train_whisper import (
     DataCollatorSpeechSeq2SeqWithPadding,
     build_training_args,
