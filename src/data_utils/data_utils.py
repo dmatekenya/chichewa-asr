@@ -47,7 +47,6 @@ def duration_split_train_val(df, duration_col, valid_frac, seed):
         df.loc[val_idx].reset_index(drop=True),
     )
 
-
 def load_audio_data(
     manifest_path: str,
     audio_dir: str,
@@ -112,3 +111,86 @@ def load_audio_data(
         # No split, return all data as a single Dataset (for hold-out/test set)
         print(f"  all_data   : {len(df):>5,} utterances  |  {total_duration / 3600:.2f} hrs (100.0%)")
         return _to_hf_dataset(df, duration_col, sampling_rate)
+    
+def sample_by_duration(
+    df: pd.DataFrame,
+    duration_column: str = "duration",
+    target_hours: float = 10,
+    duration_bins: list[float] | None = None,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """
+    Sample audio records up to a target number of hours while preserving the
+    distribution of audio durations.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Metadata dataframe containing audio durations.
+    duration_column : str
+        Name of the column containing duration in seconds.
+    target_hours : float
+        Target number of hours to sample.
+    duration_bins : list[float] | None
+        Duration bin edges in seconds. If None, default ASR-friendly bins are used.
+    random_state : int
+        Random seed for reproducible sampling.
+
+    Returns
+    -------
+    pd.DataFrame
+        Duration-stratified sampled dataframe.
+    """
+
+    if duration_bins is None:
+        duration_bins = [0, 5, 10, 15, 20, 30, 45]
+
+    df = df.copy()
+
+    target_seconds = target_hours * 3600
+
+    df["duration_bin"] = pd.cut(
+        df[duration_column],
+        bins=duration_bins,
+        include_lowest=True,
+    )
+
+    bin_summary = (
+        df.groupby("duration_bin", observed=True)
+        .agg(total_seconds=(duration_column, "sum"))
+        .reset_index()
+    )
+
+    bin_summary["duration_fraction"] = (
+        bin_summary["total_seconds"] / bin_summary["total_seconds"].sum()
+    )
+
+    sampled_parts = []
+
+    for _, row in bin_summary.iterrows():
+        bin_label = row["duration_bin"]
+        target_bin_seconds = row["duration_fraction"] * target_seconds
+
+        subset = df[df["duration_bin"] == bin_label].copy()
+
+        subset = subset.sample(
+            frac=1,
+            random_state=random_state,
+        )
+
+        subset["cum_duration"] = subset[duration_column].cumsum()
+
+        sampled_subset = subset[
+            subset["cum_duration"] <= target_bin_seconds
+        ]
+
+        sampled_parts.append(sampled_subset)
+
+    sampled_df = pd.concat(sampled_parts, ignore_index=True)
+
+    sampled_df = sampled_df.drop(
+        columns=["cum_duration"],
+        errors="ignore",
+    )
+
+    return sampled_df
