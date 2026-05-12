@@ -1,6 +1,8 @@
 from pathlib import Path
 import pandas as pd
 import numpy as np
+import librosa
+from tqdm import tqdm
 
 from datasets import Dataset,DatasetDict, Audio, Features, Value
 
@@ -194,3 +196,60 @@ def sample_by_duration(
     )
 
     return sampled_df
+
+def compute_total_audio_duration(
+    audio_dir: str | Path,
+    extensions: tuple = (".wav", ".mp3", ".flac", ".m4a"),
+) -> pd.DataFrame:
+    """
+    Load audio files in a folder and compute durations.
+
+    Parameters
+    ----------
+    audio_dir : str | Path
+        Directory containing audio files.
+    extensions : tuple
+        Audio file extensions to include.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing file paths and durations.
+    """
+
+    audio_dir = Path(audio_dir)
+
+    audio_files = []
+
+    for ext in extensions:
+        audio_files.extend(audio_dir.rglob(f"*{ext}"))
+
+    records = []
+
+    for audio_path in tqdm(audio_files):
+
+        try:
+            duration = librosa.get_duration(
+                path=str(audio_path)
+            )
+
+            records.append(
+                {
+                    "audio_path": str(audio_path),
+                    "duration": duration,
+                }
+            )
+
+        except Exception as e:
+
+            print(f"Failed: {audio_path}")
+            print(e)
+
+    df = pd.DataFrame(records)
+
+    total_hours = df["duration"].sum() / 3600
+
+    print(f"\nTotal files: {len(df):,}")
+    print(f"Total duration: {total_hours:.2f} hours")
+
+    return total_hours
