@@ -30,4 +30,4 @@ hub:
   push_to_hub: true
   hub_strategy: every_save              # push checkpoint to Hub at every save_steps
   report_to:
-    - wandb
+    - tensorboard
