@@ -10,7 +10,7 @@ training:
   gradient_accumulation_steps: 2        # effective batch size = 32
   learning_rate: 1.0e-5                 # key default — don't change first
   warmup_steps: 500
-  max_steps: 5000                       # ~3-4 epochs for 14h @ 16kHz
+  max_steps: 7500                       # upper bound — early stopping will likely cut this short for 14h data
   gradient_checkpointing: true
   fp16: true                            # H100 also supports bf16
   predict_with_generate: true
