@@ -80,7 +80,9 @@ def prepare_whisper_batch(
 
     if text_column is not None:
         batch["labels"] = processor.tokenizer(
-            batch[text_column]
+            batch[text_column],
+            truncation=True,
+            max_length=448,
         ).input_ids
 
     return batch
