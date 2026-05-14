@@ -9,6 +9,7 @@ running final hold-out evaluation.
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import evaluate
@@ -21,7 +22,6 @@ from transformers import Seq2SeqTrainingArguments
 def load_config(config_path: str) -> dict:
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
-
 
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
@@ -85,7 +85,6 @@ def prepare_whisper_batch(
 
     return batch
 
-
 wer_metric = evaluate.load("wer")
 cer_metric = evaluate.load("cer")
 
@@ -121,92 +120,72 @@ def compute_asr_metrics(pred, processor):
     }
 
 def build_training_args(config: dict, output_dir, hub_model_id) -> Seq2SeqTrainingArguments:
+    hub_cfg = {k: v for k, v in config["hub"].items() if k != "report_to"}
     return Seq2SeqTrainingArguments(
         output_dir=output_dir,
         hub_model_id=hub_model_id,
-        push_to_hub=config["hub"]["push_to_hub"],
         report_to=config["hub"]["report_to"],
+        **hub_cfg,
         **config["training"],
         **config["evaluation"],
     )
 
-def evaluate_holdout_set(
+def run_evaluation(
     model,
     processor,
     dataset: Dataset,
-    text_column: str = "sentence",
-    fname_column: str = "audio_fname",
-    output_csv=None,
+    duration_label: str,
+    results_dir,
     batch_size: int = 8,
-):
+    model_id: str = None,
+    debug: bool = False,
+) -> pd.DataFrame:
     """
-    Run inference on a prepared hold-out ASR dataset and compute WER/CER.
+    Run inference on the held-out test set, compute WER/CER, and save predictions.
 
-    Parameters
-    ----------
-    model : transformers model
-        Fine-tuned Whisper model.
-    processor : transformers processor
-        Whisper processor.
-    dataset : datasets.Dataset
-        Prepared hold-out test dataset with 'input_features', text_column,
-        and fname_column retained from preprocessing.
-    text_column : str
-        Column containing reference transcripts (default: 'sentence').
-    fname_column : str
-        Column containing audio filenames for traceability (default: 'audio_fname').
-    output_csv : str or Path, optional
-        Path to save predictions and references.
-    batch_size : int
-        Batch size for inference.
-
-    Returns
-    -------
-    dict
-        Dictionary with WER, CER, and dataframe of predictions.
+    Returns a DataFrame with columns: model_id, audio_fname, reference, prediction,
+    wer_utterance, wer_avg, cer_avg.
     """
+    output_csv  = Path(results_dir) / f"predictions_{duration_label}.csv"
     predictions = []
     model.eval()
 
-    for start_idx in range(0, len(dataset), batch_size):
-        batch = dataset[start_idx : start_idx + batch_size]
+    dataset_eval = dataset
+    if debug:
+        print("[DEBUG] Running evaluation on a small sample of the test set.")
+        sample_size  = min(16, len(dataset))
+        dataset_eval = dataset.select(range(sample_size)) if hasattr(dataset, "select") else dataset[:sample_size]
 
-        input_features = torch.tensor(
-            batch["input_features"],
-            device=model.device,
-        )
+    for start in range(0, len(dataset_eval), batch_size):
+        batch          = dataset_eval[start : start + batch_size]
+        input_features = torch.tensor(batch["input_features"], device=model.device)
 
         with torch.no_grad():
             predicted_ids = model.generate(input_features)
 
-        pred_text = processor.tokenizer.batch_decode(
-            predicted_ids,
-            skip_special_tokens=True,
-        )
-
-        predictions.extend(pred_text)
+        predictions.extend(processor.tokenizer.batch_decode(predicted_ids, skip_special_tokens=True))
 
     results_df = pd.DataFrame({
-        fname_column:  dataset[fname_column],
-        "reference":   dataset[text_column],
+        "model_id":    model_id,
+        "audio_fname": dataset_eval["audio_fname"],
+        "reference":   dataset_eval["sentence"],
         "prediction":  predictions,
     })
 
-    wer = 100 * wer_metric.compute(
+    results_df["wer_utterance"] = [
+        100 * wer_metric.compute(predictions=[p], references=[r])
+        for p, r in zip(results_df["prediction"], results_df["reference"])
+    ]
+    results_df["wer_avg"] = 100 * wer_metric.compute(
+        predictions=results_df["prediction"].tolist(),
+        references=results_df["reference"].tolist(),
+    )
+    results_df["cer_avg"] = 100 * cer_metric.compute(
         predictions=results_df["prediction"].tolist(),
         references=results_df["reference"].tolist(),
     )
 
-    cer = 100 * cer_metric.compute(
-        predictions=results_df["prediction"].tolist(),
-        references=results_df["reference"].tolist(),
-    )
-
-    if output_csv is not None:
-        results_df.to_csv(output_csv, index=False)
-
-    return {
-        "wer": wer,
-        "cer": cer,
-        "predictions": results_df,
-    }
+    results_df.to_csv(output_csv, index=False)
+    print(f"  WER (corpus): {results_df['wer_avg'].iloc[0]:.2f}%   CER (corpus): {results_df['cer_avg'].iloc[0]:.2f}%")
+    print(f"  Predictions saved: {output_csv}")
+    return results_df

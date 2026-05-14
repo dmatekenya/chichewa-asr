@@ -1,0 +1,33 @@
+# Baseline hyperparameters recommended by Claude (claude-sonnet-4-6), 2026-05-13
+# Source: Seq2SeqTrainingArguments defaults for Whisper fine-tuning
+model:
+  model_name_or_path: openai/whisper-large-v3
+  language: shona
+  task: transcribe
+
+training:
+  per_device_train_batch_size: 16
+  gradient_accumulation_steps: 2        # effective batch size = 32
+  learning_rate: 1.0e-5                 # key default — don't change first
+  warmup_steps: 500
+  max_steps: 5000                       # ~3-4 epochs for 14h @ 16kHz
+  gradient_checkpointing: true
+  fp16: true                            # H100 also supports bf16
+  predict_with_generate: true
+  generation_max_length: 225
+  save_steps: 500
+  logging_steps: 25
+
+evaluation:
+  eval_strategy: steps
+  eval_steps: 500
+  load_best_model_at_end: true
+  metric_for_best_model: wer
+  greater_is_better: false
+  save_total_limit: 3                   # keep only 3 checkpoints locally
+
+hub:
+  push_to_hub: true
+  hub_strategy: every_save              # push checkpoint to Hub at every save_steps
+  report_to:
+    - wandb

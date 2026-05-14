@@ -27,10 +27,7 @@ Typical notebook usage
 """
 
 from functools import partial
-from pathlib import Path
 
-import evaluate
-import pandas as pd
 import torch
 from transformers import (
     Seq2SeqTrainer,
@@ -44,11 +41,8 @@ from src.train.train_whisper import (
     build_training_args,
     compute_asr_metrics,
     prepare_whisper_batch,
+    run_evaluation,
 )
-
-# Load WER/CER metrics once at the module level to avoid redundant loads across runs.
-_wer_metric = evaluate.load("wer")
-_cer_metric = evaluate.load("cer")
 
 
 def load_model_and_processor(config: dict):
@@ -165,63 +159,3 @@ def run_training(model, processor, dataset_train, run_config: dict, hub_model_id
     trainer.train()
     return trainer
 
-def run_evaluation(
-    model,
-    processor,
-    dataset_test,
-    duration_label: str,
-    results_dir: Path,
-    batch_size: int = 8,
-    model_id: str = None,
-    debug: bool = False,
-) -> dict:
-    """
-    Run inference on the held-out test set, compute WER/CER, and save predictions.
-
-    Returns
-    -------
-    dict with 'wer', 'cer', and 'predictions' (DataFrame).
-    """
-    output_csv  = Path(results_dir) / f"predictions_{duration_label}.csv"
-    predictions = []
-    model.eval()
-
-    # If debug mode, use only a small sample of the test set
-    if debug:
-        print("[DEBUG] Running evaluation on a small sample of the test set.")
-        sample_size = min(16, len(dataset_test))
-        dataset_eval = dataset_test.select(range(sample_size)) if hasattr(dataset_test, 'select') else dataset_test[:sample_size]
-    else:
-        dataset_eval = dataset_test
-
-    for start in range(0, len(dataset_eval), batch_size):
-        batch          = dataset_eval[start : start + batch_size]
-        input_features = torch.tensor(batch["input_features"], device=model.device)
-
-        with torch.no_grad():
-            predicted_ids = model.generate(input_features)
-
-        pred_text = processor.tokenizer.batch_decode(predicted_ids, skip_special_tokens=True)
-        predictions.extend(pred_text)
-
-    results_df = pd.DataFrame({
-        "model_id":    model_id,
-        "audio_fname": dataset_eval["audio_fname"],
-        "reference":   dataset_eval["sentence"],
-        "prediction":  predictions,
-    })
-
-    wer = 100 * _wer_metric.compute(
-        predictions=results_df["prediction"].tolist(),
-        references=results_df["reference"].tolist(),
-    )
-    cer = 100 * _cer_metric.compute(
-        predictions=results_df["prediction"].tolist(),
-        references=results_df["reference"].tolist(),
-    )
-
-    results_df.to_csv(output_csv, index=False)
-    
-    print(f"  WER: {wer:.2f}%   CER: {cer:.2f}%")
-    print(f"  Predictions saved: {output_csv}")
-    return {"wer": wer, "cer": cer, "predictions": results_df}

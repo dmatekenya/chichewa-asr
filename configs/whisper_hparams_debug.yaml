@@ -1,0 +1,34 @@
+# Debug config — fast iteration only, not for real training runs
+# Mirror of whisper_hparams_baseline.yaml with minimal steps/batch sizes
+
+model:
+  model_name_or_path: openai/whisper-small
+  language: shona
+  task: transcribe
+
+training:
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-5
+  warmup_steps: 5
+  max_steps: 20
+  gradient_checkpointing: false
+  fp16: false
+  predict_with_generate: true
+  generation_max_length: 225
+  save_steps: 10
+  logging_steps: 5
+
+evaluation:
+  eval_strategy: steps
+  eval_steps: 10
+  load_best_model_at_end: true
+  metric_for_best_model: wer
+  greater_is_better: false
+  save_total_limit: 2
+
+hub:
+  push_to_hub: false
+  hub_strategy: end
+  report_to:
+    - wandb
