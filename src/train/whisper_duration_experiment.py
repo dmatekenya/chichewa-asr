@@ -27,8 +27,10 @@ Typical notebook usage
 """
 
 from functools import partial
+from pathlib import Path
 
 import torch
+from datasets import Audio, load_from_disk
 from transformers import (
     Seq2SeqTrainer,
     WhisperForConditionalGeneration,
@@ -68,24 +70,37 @@ def load_model_and_processor(config: dict):
 
     return model, processor
 
-def prepare_train_dataset(manifest_path, audio_dir, processor):
+def prepare_train_dataset(manifest_path, audio_dir, processor, cache_dir=None, num_proc=4):
     """
     Load a duration manifest and map audio + text to Whisper input features.
+    If cache_dir is provided, saves the processed dataset on first run and
+    reloads from disk on subsequent runs.
 
     Returns
     -------
     DatasetDict with 'train' and 'validation' splits, features mapped.
     """
+    if cache_dir is not None and Path(cache_dir).exists():
+        print(f"  Loading train data from cache: {cache_dir}")
+        return load_from_disk(str(cache_dir))
+
     print(f"  Loading train data: {manifest_path}")
     raw = load_audio_data(manifest_path, audio_dir=audio_dir)
+    raw = raw.cast_column("audio", Audio(sampling_rate=16000))
 
-    return raw.map(
+    dataset = raw.map(
         lambda batch: prepare_whisper_batch(
             batch, processor=processor, audio_column="audio", text_column="sentence"
         ),
         remove_columns=raw["train"].column_names,
-        num_proc=4,
+        num_proc=num_proc,
     )
+
+    if cache_dir is not None:
+        print(f"  Saving processed dataset to cache: {cache_dir}")
+        dataset.save_to_disk(str(cache_dir))
+
+    return dataset
 
 def prepare_test_dataset(
     manifest_path,
@@ -93,16 +108,22 @@ def prepare_test_dataset(
     base_config: dict,
     audio_fname_col: str = "audio_filename",
     duration_col: str = "duration_seconds",
+    cache_dir=None,
 ):
     """
     Pre-process the held-out test set once before the sweep loop.
     Whisper log-mel features are model-agnostic so the result is safe
-    to reuse across all runs.
+    to reuse across all runs. If cache_dir is provided, saves on first
+    run and reloads from disk on subsequent runs.
 
     Returns
     -------
     Dataset with 'input_features', 'sentence', 'audio_fname'.
     """
+    if cache_dir is not None and Path(cache_dir).exists():
+        print(f"  Loading test data from cache: {cache_dir}")
+        return load_from_disk(str(cache_dir))
+
     print(f"  Loading test data: {manifest_path}")
     model_id  = base_config["model"]["model_name_or_path"]
     processor = WhisperProcessor.from_pretrained(
@@ -118,10 +139,10 @@ def prepare_test_dataset(
         split_data=False,
         duration_col=duration_col,
     )
+    raw = raw.cast_column("audio", Audio(sampling_rate=16000))
 
-    # Only remove 'audio' — sentence and audio_fname must survive for evaluation
     cols_to_remove = [c for c in raw.column_names if c != "audio"]
-    return raw.map(
+    dataset = raw.map(
         lambda batch: {
             **prepare_whisper_batch(
                 batch, processor=processor, audio_column="audio", text_column="sentence"
@@ -131,6 +152,12 @@ def prepare_test_dataset(
         remove_columns=cols_to_remove,
         num_proc=1,
     )
+
+    if cache_dir is not None:
+        print(f"  Saving processed test dataset to cache: {cache_dir}")
+        dataset.save_to_disk(str(cache_dir))
+
+    return dataset
 
 def run_training(model, processor, dataset_train, run_config: dict, hub_model_id, output_dir):
     """
