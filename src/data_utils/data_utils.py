@@ -1,7 +1,11 @@
+import random
+import re
 from pathlib import Path
 import pandas as pd
 import numpy as np
 import librosa
+from prompt_toolkit import HTML
+from IPython.display import display, HTML
 from tqdm import tqdm
 
 from datasets import Dataset,DatasetDict, Audio, Features, Value
@@ -24,7 +28,6 @@ def _to_hf_dataset(df: pd.DataFrame, duration_col: str, sampling_rate: int) -> D
 
     ds = Dataset.from_dict(data)
     return ds.cast_column("audio", Audio(sampling_rate=sampling_rate))
-
 
 def duration_split_train_val(df, duration_col, valid_frac, seed):
     """
@@ -253,3 +256,26 @@ def compute_total_audio_duration(
     print(f"Total duration: {total_hours:.2f} hours")
 
     return total_hours
+
+def show_random_elements(dataset, num_examples=10):
+    assert num_examples <= len(dataset), "Can't pick more elements than there are in the dataset."
+    picks = []
+    for _ in range(num_examples):
+        pick = random.randint(0, len(dataset)-1)
+        while pick in picks:
+            pick = random.randint(0, len(dataset)-1)
+        picks.append(pick)
+
+    df = pd.DataFrame(dataset[picks])
+    display(HTML(df.to_html()))
+
+def remove_special_characters(batch, transcript_column="sentence", 
+                              charecters_to_remove_regex=r"[^a-zA-Z0-9\s]"):
+    batch[transcript_column] = re.sub(charecters_to_remove_regex, '', batch[transcript_column]).lower()
+    return batch
+
+def extract_all_chars(batch, transcript_column="sentence"):
+    all_text = " ".join(batch[transcript_column])
+    vocab = list(set(all_text))
+    return {"vocab": [vocab], "all_text": [all_text]}
+
