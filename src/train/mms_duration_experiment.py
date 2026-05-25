@@ -40,6 +40,8 @@ from transformers import (
 )
 
 from src.data_utils.data_utils import extract_all_chars, load_audio_data, remove_special_characters
+from transformers import EarlyStoppingCallback
+
 from src.train.train_mms import (
     DataCollatorCTCWithPadding,
     build_training_args,
@@ -211,6 +213,10 @@ def load_model_and_processor(config: dict, processor_dir) -> tuple:
     adapter_weights = model.load_adapter(target_lang)
     print(f"  Adapter loaded for lang: {target_lang}")
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    print(f"  Model device: {device}")
+
     return model, processor
 
 
@@ -300,15 +306,25 @@ def prepare_test_dataset(
     return dataset
 
 
-def run_training(model, processor, dataset_train, run_config: dict, hub_model_id, output_dir, debug: bool = False):
+def run_training(
+    model,
+    processor,
+    dataset_train,
+    run_config: dict,
+    hub_model_id,
+    output_dir,
+    debug: bool = False,
+    patience: int = 3,
+):
     """
     Configure and run Trainer for MMS CTC adapter fine-tuning.
 
     Parameters
     ----------
     debug : bool
-        If True, forces CPU training (required on MPS since CTC loss is not
-        implemented for Apple GPU).
+        Forces CPU training (required on MPS — CTC loss not supported on Apple GPU).
+    patience : int
+        Early-stopping patience in evaluation steps. Set to 0 to disable.
 
     Returns
     -------
@@ -324,6 +340,8 @@ def run_training(model, processor, dataset_train, run_config: dict, hub_model_id
 
     training_args = build_training_args(run_config, output_dir, hub_model_id, **overrides)
 
+    callbacks = [EarlyStoppingCallback(early_stopping_patience=patience)] if patience > 0 else []
+
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -332,6 +350,7 @@ def run_training(model, processor, dataset_train, run_config: dict, hub_model_id
         data_collator=data_collator,
         compute_metrics=partial(compute_mms_corpus_metrics, processor=processor, training_mode=True),
         processing_class=processor.feature_extractor,
+        callbacks=callbacks,
     )
 
     print("  Training ...")
