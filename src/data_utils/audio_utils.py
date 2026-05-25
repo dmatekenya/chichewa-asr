@@ -46,15 +46,10 @@ import requests
 import soundfile as sf
 from tqdm import tqdm
 
-# Optional/ASR-related imports
+# ASR backend imports (only used by HFASRBackend)
 import torch
 from jiwer import cer, wer
 from openai import OpenAI
-from transformers import pipeline
-import torch
-from jiwer import cer, wer
-from openai import OpenAI
-from tqdm import tqdm
 from transformers import pipeline
 
 def get_total_audio_duration(folder: str | Path, exts=None) -> float:
@@ -328,6 +323,51 @@ def estimate_snr_db(
     return float(snr_db)
 
 
+def compute_clipping_ratio(waveform: np.ndarray, threshold: float = 0.99) -> float:
+    """
+    Compute the fraction of samples at or near maximum amplitude (clipping).
+
+    Parameters
+    ----------
+    waveform : np.ndarray
+        Input mono waveform (float32, range [-1, 1]).
+    threshold : float, optional
+        Fraction of max amplitude above which a sample is considered clipped, by default 0.99.
+
+    Returns
+    -------
+    float
+        Fraction of clipped samples in [0, 1]. Values above ~0.01 indicate recording issues.
+    """
+    if waveform.size == 0:
+        return float("nan")
+    return float(np.mean(np.abs(waveform) >= threshold))
+
+
+def compute_spectral_flatness(waveform: np.ndarray) -> float:
+    """
+    Compute mean spectral flatness of a waveform.
+
+    Spectral flatness is the ratio of geometric mean to arithmetic mean of the
+    power spectrum. Values near 1.0 indicate noise-like content; values near 0.0
+    indicate tonal/speech content.
+
+    Parameters
+    ----------
+    waveform : np.ndarray
+        Input mono waveform.
+
+    Returns
+    -------
+    float
+        Mean spectral flatness in [0, 1].
+    """
+    if waveform.size == 0:
+        return float("nan")
+    flatness = librosa.feature.spectral_flatness(y=waveform)
+    return float(np.mean(flatness))
+
+
 def compute_audio_attributes(
     audio_path: str,
     frame_length: int = 400,
@@ -378,19 +418,79 @@ def compute_audio_attributes(
         noise_percentile=noise_percentile,
     )
 
+    clipping_ratio    = compute_clipping_ratio(waveform)
+    spectral_flatness = compute_spectral_flatness(waveform)
+
     return {
-        "sample_rate": sample_rate,
-        "num_samples": int(len(waveform)),
-        "duration_sec": float(duration_sec),
-        "rms": rms,
-        "peak_abs": peak_abs,
-        "silence_ratio": silence_ratio,
-        "snr_db_est": snr_db_est,
-        "num_channels": channel_info["num_channels"],
-        "channel_strategy": channel_info["channel_strategy"],
-        "channel_rms_diff": channel_info["channel_rms_diff"],
-        "dominant_channel": channel_info["dominant_channel"],
+        "sample_rate":       sample_rate,
+        "num_samples":       int(len(waveform)),
+        "duration_sec":      float(duration_sec),
+        "rms":               rms,
+        "peak_abs":          peak_abs,
+        "silence_ratio":     silence_ratio,
+        "snr_db_est":        snr_db_est,
+        "clipping_ratio":    clipping_ratio,
+        "spectral_flatness": spectral_flatness,
+        "num_channels":      channel_info["num_channels"],
+        "channel_strategy":  channel_info["channel_strategy"],
+        "channel_rms_diff":  channel_info["channel_rms_diff"],
+        "dominant_channel":  channel_info["dominant_channel"],
     }
+
+
+def compute_quality_metrics_for_manifest(
+    manifest_csv: str | Path,
+    audio_dir: str | Path,
+    audio_col: str = "audio_filename",
+    output_csv: Optional[str | Path] = None,
+) -> pd.DataFrame:
+    """
+    Compute audio quality metrics for every file listed in a manifest CSV.
+
+    Calls `compute_audio_attributes` on each file and merges the results back
+    into the original manifest as additional columns.
+
+    Parameters
+    ----------
+    manifest_csv : str or Path
+        Path to the CSV manifest file.
+    audio_dir : str or Path
+        Directory containing the audio files.
+    audio_col : str, optional
+        Column in the manifest containing audio filenames, by default 'audio_filename'.
+    output_csv : str or Path, optional
+        If provided, saves the enriched DataFrame to this path.
+
+    Returns
+    -------
+    pd.DataFrame
+        Original manifest with quality metric columns appended.
+    """
+    audio_dir = Path(audio_dir)
+    df = pd.read_csv(manifest_csv)
+    records = []
+
+    for fname in tqdm(df[audio_col], desc="Computing audio quality metrics"):
+        audio_path = audio_dir / fname
+        try:
+            attrs = compute_audio_attributes(str(audio_path))
+        except Exception as e:
+            attrs = {k: float("nan") for k in [
+                "sample_rate", "num_samples", "duration_sec", "rms", "peak_abs",
+                "silence_ratio", "snr_db_est", "clipping_ratio", "spectral_flatness",
+                "num_channels", "channel_strategy", "channel_rms_diff", "dominant_channel",
+            ]}
+            print(f"  Warning: could not process {fname}: {e}")
+        records.append(attrs)
+
+    metrics_df = pd.DataFrame(records)
+    result = pd.concat([df.reset_index(drop=True), metrics_df], axis=1)
+
+    if output_csv is not None:
+        result.to_csv(output_csv, index=False)
+        print(f"Saved to {output_csv}")
+
+    return result
 
 
 def load_audio_16k_mono(audio_path: str) -> tuple[np.ndarray, int]:

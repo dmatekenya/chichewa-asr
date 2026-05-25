@@ -1,0 +1,30 @@
+# MMS debug config — fast iteration only, not for real training runs
+model:
+  model_name_or_path: facebook/mms-1b-all
+  target_lang: nya
+
+training:
+  per_device_train_batch_size: 2
+  learning_rate: 1.0e-3
+  warmup_steps: 5
+  max_steps: 20
+  gradient_checkpointing: false
+  bf16: false
+  train_sampling_strategy: group_by_length
+  length_column_name: input_length
+  save_steps: 10
+  logging_steps: 5
+  save_total_limit: 2
+
+evaluation:
+  eval_strategy: steps
+  eval_steps: 10
+  load_best_model_at_end: true
+  metric_for_best_model: wer
+  greater_is_better: false
+
+hub:
+  push_to_hub: false
+  hub_strategy: end
+  report_to:
+    - tensorboard

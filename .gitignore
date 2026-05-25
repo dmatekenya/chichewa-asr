@@ -10,6 +10,8 @@ outputs/
 
 # Models
 models/
+src/**/checkpoint-*/
+src/**/checkpoint-*/
 
 # C extensions
 *.so

@@ -5,12 +5,14 @@ This module is designed to be imported into a Colab or Jupyter notebook.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Union
+from pathlib import Path
+from typing import Dict, List, Optional, Union
 
 import numpy as np
+import pandas as pd
 import torch
 from evaluate import load
-from transformers import Wav2Vec2Processor
+from transformers import TrainingArguments, Wav2Vec2Processor
 
 WER_METRIC = load("wer")
 CER_METRIC = load("cer")
@@ -61,6 +63,18 @@ class DataCollatorCTCWithPadding:
 
         return batch
 
+def build_training_args(config: dict, output_dir, hub_model_id, **overrides) -> TrainingArguments:
+    hub_cfg = {k: v for k, v in config["hub"].items() if k != "report_to"}
+    return TrainingArguments(
+        output_dir=output_dir,
+        hub_model_id=hub_model_id,
+        report_to=config["hub"]["report_to"],
+        **hub_cfg,
+        **config["training"],
+        **config["evaluation"],
+        **overrides,
+    )
+
 def prepare_mms_batch(batch, processor, text_column="sentence"):
     audio = batch["audio"]
 
@@ -92,3 +106,70 @@ def compute_mms_corpus_metrics(pred, processor, training_mode: bool = False):
 
     cer = CER_METRIC.compute(predictions=pred_str, references=label_str)
     return {"wer": wer * 100, "cer": cer * 100}
+
+def run_evaluation(
+    model,
+    processor,
+    dataset,
+    duration_label: str,
+    results_dir,
+    batch_size: int = 8,
+    model_id: Optional[str] = None,
+    debug: bool = False,
+) -> pd.DataFrame:
+    """
+    Run inference on the held-out test set, compute WER/CER, and save predictions.
+
+    Returns a DataFrame with columns: model_id, audio_fname, reference, prediction,
+    wer_utterance, wer_avg, cer_avg.
+    """
+    output_csv  = Path(results_dir) / f"predictions_{duration_label}.csv"
+    predictions = []
+    model.eval()
+
+    dataset_eval = dataset
+    if debug:
+        print("[DEBUG] Running evaluation on a small sample of the test set.")
+        sample_size  = min(16, len(dataset))
+        dataset_eval = dataset.select(range(sample_size)) if hasattr(dataset, "select") else dataset[:sample_size]
+
+    for start in range(0, len(dataset_eval), batch_size):
+        batch = dataset_eval[start : start + batch_size]
+        padded = processor.pad(
+            [{"input_values": iv} for iv in batch["input_values"]],
+            padding=True,
+            return_tensors="pt",
+        )
+        input_values = padded.input_values.to(model.device)
+        attention_mask = padded.attention_mask.to(model.device)
+
+        with torch.no_grad():
+            logits = model(input_values, attention_mask=attention_mask).logits
+
+        predicted_ids = torch.argmax(logits, dim=-1)
+        predictions.extend(processor.batch_decode(predicted_ids))
+
+    results_df = pd.DataFrame({
+        "model_id":    model_id,
+        "audio_fname": dataset_eval["audio_fname"],
+        "reference":   dataset_eval["sentence"],
+        "prediction":  predictions,
+    })
+
+    results_df["wer_utterance"] = [
+        100 * WER_METRIC.compute(predictions=[p], references=[r])
+        for p, r in zip(results_df["prediction"], results_df["reference"])
+    ]
+    results_df["wer_avg"] = 100 * WER_METRIC.compute(
+        predictions=results_df["prediction"].tolist(),
+        references=results_df["reference"].tolist(),
+    )
+    results_df["cer_avg"] = 100 * CER_METRIC.compute(
+        predictions=results_df["prediction"].tolist(),
+        references=results_df["reference"].tolist(),
+    )
+
+    results_df.to_csv(output_csv, index=False)
+    print(f"  WER (corpus): {results_df['wer_avg'].iloc[0]:.2f}%   CER (corpus): {results_df['cer_avg'].iloc[0]:.2f}%")
+    print(f"  Predictions saved: {output_csv}")
+    return results_df
