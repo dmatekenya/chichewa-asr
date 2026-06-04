@@ -288,14 +288,13 @@ def prepare_test_dataset(
     ))
     raw = raw.cast_column("audio", Audio(sampling_rate=16000))
 
-    cols_to_remove = [c for c in raw.column_names if c not in ("audio_fname", "sentence")]
     dataset = raw.map(
         lambda batch: {
             **prepare_mms_batch(batch, processor=processor, text_column="sentence"),
             "audio_fname": batch["audio_fname"],
             "sentence":    batch["sentence"],
         },
-        remove_columns=cols_to_remove,
+        remove_columns=raw.column_names,  # remove all; lambda defines output exactly
         num_proc=1,
     )
 

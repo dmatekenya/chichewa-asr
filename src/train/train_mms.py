@@ -152,21 +152,21 @@ def run_evaluation(
     results_df = pd.DataFrame({
         "model_id":    model_id,
         "audio_fname": dataset_eval["audio_fname"],
-        "reference":   dataset_eval["sentence"],
+        "sentence":    dataset_eval["sentence"],
         "prediction":  predictions,
     })
 
     results_df["wer_utterance"] = [
         100 * WER_METRIC.compute(predictions=[p], references=[r])
-        for p, r in zip(results_df["prediction"], results_df["reference"])
+        for p, r in zip(results_df["prediction"], results_df["sentence"])
     ]
     results_df["wer_avg"] = 100 * WER_METRIC.compute(
         predictions=results_df["prediction"].tolist(),
-        references=results_df["reference"].tolist(),
+        references=results_df["sentence"].tolist(),
     )
     results_df["cer_avg"] = 100 * CER_METRIC.compute(
         predictions=results_df["prediction"].tolist(),
-        references=results_df["reference"].tolist(),
+        references=results_df["sentence"].tolist(),
     )
 
     results_df.to_csv(output_csv, index=False)

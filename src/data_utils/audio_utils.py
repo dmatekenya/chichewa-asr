@@ -1,10 +1,11 @@
 """
-Utility script for generating standardized acoustic attributes for ASR datasets.
+Utility module for generating standardized acoustic attributes for ASR datasets.
 
-This script computes common audio-level attributes such as duration, RMS,
-peak amplitude, silence ratio, and a heuristic SNR estimate. It is designed
-to be used on fixed train/dev/test metadata files so that attribute generation
-is standardized across experiments.
+This module computes common audio-level attributes such as duration, RMS,
+peak amplitude, silence ratio, a heuristic SNR estimate, voice-activity ratio,
+effective bandwidth, crest factor, zero-crossing rate, and a rough RT60
+estimate. It is designed to be used on fixed train/dev/test metadata files so
+that attribute generation is standardized across experiments.
 
 Example
 -------
@@ -22,38 +23,26 @@ Notes
 - Audio is converted to mono before analysis.
 - Silence ratio is computed using frame-level RMS values.
 - SNR is only a heuristic estimate when no clean reference signal is available.
+- VAD speech ratio uses a dual-criterion energy + spectral-flatness approach.
+- RT60 is estimated via Schroeder backward integration; treat as approximate.
+- ASR inference backends live in asr_backends.py, not here.
 """
 
 from __future__ import annotations
 
 # Standard library imports
-import argparse
-import json
 import math
-import os
-import re
 import tempfile
-import time
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 # Third-party imports
 import librosa
 import numpy as np
-import pandas as pd
-import requests
 import soundfile as sf
-from tqdm import tqdm
 
-# ASR backend imports (only used by HFASRBackend)
-import torch
-from jiwer import cer, wer
-from openai import OpenAI
-from transformers import pipeline
 
 def get_total_audio_duration(folder: str | Path, exts=None) -> float:
-
     """
     Calculate the total duration of all audio files in a folder.
 
@@ -62,14 +51,13 @@ def get_total_audio_duration(folder: str | Path, exts=None) -> float:
     folder : str or Path
         Path to the folder containing audio files.
     exts : list or None
-        List of file extensions to include (e.g., ['.wav', '.mp3']). If None, defaults to common audio types.
-    units : str, optional
-        Units for return value: 'seconds', 'minutes', or 'hours'. Default is 'seconds'.
+        List of file extensions to include (e.g., ['.wav', '.mp3']).
+        If None, defaults to common audio types.
 
     Returns
     -------
     float
-        Total duration in the requested units.
+        Total duration in seconds.
     """
     if exts is None:
         exts = ['.wav', '.mp3', '.ogg', '.flac', '.m4a']
@@ -78,25 +66,32 @@ def get_total_audio_duration(folder: str | Path, exts=None) -> float:
     for ext in exts:
         for audio_file in folder.glob(f'*{ext}'):
             try:
-                duration = librosa.get_duration(filename=str(audio_file))
+                duration = librosa.get_duration(path=str(audio_file))
                 total_duration += duration
             except Exception as e:
                 print(f"Could not process {audio_file}: {e}")
     return total_duration
 
 
-def get_total_audio_duration_with_units(folder: str | Path, exts=None, units: str = 'seconds') -> float:
+def get_total_audio_duration_with_units(
+    folder: str | Path,
+    exts=None,
+    units: str = 'seconds',
+) -> float:
     """
-    Calculate the total duration of all audio files in a folder, with selectable units.
+    Calculate the total duration of all audio files in a folder, with
+    selectable output units.
 
     Parameters
     ----------
     folder : str or Path
         Path to the folder containing audio files.
     exts : list or None
-        List of file extensions to include (e.g., ['.wav', '.mp3']). If None, defaults to common audio types.
+        List of file extensions to include (e.g., ['.wav', '.mp3']).
+        If None, defaults to common audio types.
     units : str, optional
-        Units for return value: 'seconds', 'minutes', or 'hours'. Default is 'seconds'.
+        Output units: ``'seconds'``, ``'minutes'``, or ``'hours'``.
+        Default is ``'seconds'``.
 
     Returns
     -------
@@ -187,8 +182,13 @@ def load_audio_mono(audio_path: str) -> tuple[np.ndarray, int, Dict[str, Any]]:
             channel_info["channel_strategy"] = "averaged_to_mono"
 
         else:
-            per_channel_rms = [compute_rms(waveform[:, i].astype(np.float32)) for i in range(num_channels)]
-            channel_info["channel_rms_diff"] = float(np.max(per_channel_rms) - np.min(per_channel_rms))
+            per_channel_rms = [
+                compute_rms(waveform[:, i].astype(np.float32))
+                for i in range(num_channels)
+            ]
+            channel_info["channel_rms_diff"] = float(
+                np.max(per_channel_rms) - np.min(per_channel_rms)
+            )
             channel_info["dominant_channel"] = str(int(np.argmax(per_channel_rms)))
             channel_info["channel_strategy"] = "averaged_to_mono"
 
@@ -256,7 +256,7 @@ def compute_silence_ratio(
     Compute the proportion of frames considered silent.
 
     Silence is defined relative to the maximum frame RMS in the file.
-    Frames whose RMS is below `max_rms + silence_threshold_db` are treated
+    Frames whose RMS is below ``max_rms + silence_threshold_db`` are treated
     as silent. For example, with -40 dB, frames more than 40 dB below the
     file's loudest frame are considered silent.
 
@@ -332,12 +332,14 @@ def compute_clipping_ratio(waveform: np.ndarray, threshold: float = 0.99) -> flo
     waveform : np.ndarray
         Input mono waveform (float32, range [-1, 1]).
     threshold : float, optional
-        Fraction of max amplitude above which a sample is considered clipped, by default 0.99.
+        Fraction of max amplitude above which a sample is considered clipped,
+        by default 0.99.
 
     Returns
     -------
     float
-        Fraction of clipped samples in [0, 1]. Values above ~0.01 indicate recording issues.
+        Fraction of clipped samples in [0, 1].
+        Values above ~0.01 indicate recording issues.
     """
     if waveform.size == 0:
         return float("nan")
@@ -349,8 +351,8 @@ def compute_spectral_flatness(waveform: np.ndarray) -> float:
     Compute mean spectral flatness of a waveform.
 
     Spectral flatness is the ratio of geometric mean to arithmetic mean of the
-    power spectrum. Values near 1.0 indicate noise-like content; values near 0.0
-    indicate tonal/speech content.
+    power spectrum. Values near 1.0 indicate noise-like content; values near
+    0.0 indicate tonal/speech content.
 
     Parameters
     ----------
@@ -368,15 +370,230 @@ def compute_spectral_flatness(waveform: np.ndarray) -> float:
     return float(np.mean(flatness))
 
 
+def compute_zero_crossing_rate(waveform: np.ndarray) -> float:
+    """
+    Compute the mean zero-crossing rate (ZCR) of a waveform.
+
+    A high ZCR in nominally silent frames can indicate electrical hiss,
+    buzzing, or codec noise. For speech frames a typical ZCR is 0.02–0.15.
+
+    Parameters
+    ----------
+    waveform : np.ndarray
+        Input mono waveform.
+
+    Returns
+    -------
+    float
+        Mean ZCR across all frames (crossings per sample).
+    """
+    if waveform.size == 0:
+        return float("nan")
+    zcr = librosa.feature.zero_crossing_rate(y=waveform)
+    return float(np.mean(zcr))
+
+
+def compute_crest_factor_db(rms: float, peak_abs: float) -> float:
+    """
+    Compute the crest factor in dB (peak-to-RMS ratio).
+
+    A very low crest factor indicates a compressed or over-normalised
+    recording; a very high value indicates spiky transients.
+    Healthy speech typically falls in the 10–20 dB range.
+
+    Parameters
+    ----------
+    rms : float
+        RMS amplitude of the waveform.
+    peak_abs : float
+        Peak absolute amplitude of the waveform.
+
+    Returns
+    -------
+    float
+        Crest factor in dB.
+    """
+    if rms <= 0 or peak_abs <= 0:
+        return float("nan")
+    return float(20.0 * safe_log10(peak_abs / (rms + 1e-12)))
+
+
+def compute_effective_bandwidth_hz(
+    waveform: np.ndarray,
+    sample_rate: int,
+    energy_threshold: float = 0.01,
+) -> float:
+    """
+    Estimate the effective bandwidth of an audio file.
+
+    The effective bandwidth is the highest frequency whose FFT magnitude
+    exceeds ``energy_threshold`` times the spectral peak. Narrowband or
+    telephone-quality audio will show values well below the Nyquist limit,
+    typically below 4 kHz even when the file is stored at 16 kHz.
+
+    Parameters
+    ----------
+    waveform : np.ndarray
+        Input mono waveform.
+    sample_rate : int
+        Sample rate in Hz.
+    energy_threshold : float, optional
+        Fraction of the spectral peak below which a bin is ignored,
+        by default 0.01 (i.e., 1 %).
+
+    Returns
+    -------
+    float
+        Estimated highest significant frequency in Hz.
+    """
+    if waveform.size == 0 or sample_rate <= 0:
+        return float("nan")
+
+    fft_mag = np.abs(np.fft.rfft(waveform))
+    freqs = np.fft.rfftfreq(len(waveform), d=1.0 / sample_rate)
+    threshold = energy_threshold * fft_mag.max()
+    significant = fft_mag > threshold
+
+    if not significant.any():
+        return 0.0
+
+    return float(freqs[significant].max())
+
+
+def compute_vad_speech_ratio(
+    waveform: np.ndarray,
+    sample_rate: int,
+    frame_length: int = 400,
+    hop_length: int = 160,
+    energy_threshold_db: float = -40.0,
+    flatness_threshold: float = 0.3,
+) -> float:
+    """
+    Estimate the fraction of frames that contain speech.
+
+    Uses a dual-criterion energy-and-spectral-flatness VAD:
+    a frame is labelled as **speech** when it is both above the energy
+    threshold *and* has spectral flatness below ``flatness_threshold``
+    (speech is more tonal than broadband noise).
+
+    Parameters
+    ----------
+    waveform : np.ndarray
+        Input mono waveform.
+    sample_rate : int
+        Sample rate in Hz (currently unused, reserved for future use).
+    frame_length : int, optional
+        Frame size in samples, by default 400.
+    hop_length : int, optional
+        Hop size in samples, by default 160.
+    energy_threshold_db : float, optional
+        Relative energy threshold in dB below the file maximum,
+        by default -40.0.
+    flatness_threshold : float, optional
+        Maximum spectral flatness for a frame to be considered speech,
+        by default 0.3.
+
+    Returns
+    -------
+    float
+        Fraction of speech frames in [0, 1].
+    """
+    if waveform.size == 0:
+        return float("nan")
+
+    frame_rms = compute_frame_rms(waveform, frame_length, hop_length)
+
+    flatness = librosa.feature.spectral_flatness(
+        y=waveform,
+        n_fft=frame_length,
+        hop_length=hop_length,
+    ).squeeze(0)
+
+    # Align lengths — librosa framing may differ by ±1 frame
+    min_len = min(len(frame_rms), len(flatness))
+    frame_rms = frame_rms[:min_len]
+    flatness = flatness[:min_len]
+
+    if frame_rms.size == 0:
+        return float("nan")
+
+    max_rms = float(np.max(frame_rms))
+    if max_rms <= 0:
+        return 0.0
+
+    energy_threshold = max_rms * (10 ** (energy_threshold_db / 20.0))
+    is_speech = (frame_rms > energy_threshold) & (flatness < flatness_threshold)
+
+    return float(np.mean(is_speech))
+
+
+def estimate_rt60(
+    waveform: np.ndarray,
+    sample_rate: int,
+    decay_db: float = 20.0,
+) -> float:
+    """
+    Estimate RT60 using Schroeder backward integration.
+
+    The energy decay curve is computed by backward-integrating the squared
+    waveform (Schroeder 1965). The time for the signal to decay ``decay_db``
+    decibels is measured and then scaled to a full 60 dB decay.
+
+    This estimate is most reliable on short, dry utterances recorded in a
+    single room. Treat the result as approximate — a rough indicator of
+    reverberation level rather than a calibrated acoustic measurement.
+
+    Parameters
+    ----------
+    waveform : np.ndarray
+        Input mono waveform.
+    sample_rate : int
+        Sample rate in Hz.
+    decay_db : float, optional
+        The dB drop used to measure decay before scaling to RT60,
+        by default 20.0.
+
+    Returns
+    -------
+    float
+        Estimated RT60 in seconds, or ``nan`` if the decay cannot be
+        measured reliably.
+    """
+    if waveform.size == 0 or sample_rate <= 0:
+        return float("nan")
+
+    # Schroeder backward integration
+    energy = waveform[::-1] ** 2
+    schroeder = np.cumsum(energy)[::-1]
+    schroeder = schroeder / (schroeder[0] + 1e-12)
+    schroeder_db = 10.0 * np.log10(schroeder + 1e-12)
+
+    # Locate where the curve crosses 0 dB and -decay_db dB
+    try:
+        idx_start = int(np.where(schroeder_db <= 0.0)[0][0])
+        idx_end = int(np.where(schroeder_db <= -decay_db)[0][0])
+    except IndexError:
+        return float("nan")
+
+    if idx_end <= idx_start:
+        return float("nan")
+
+    t_decay = (idx_end - idx_start) / sample_rate
+    return float(t_decay * (60.0 / decay_db))
+
+
 def compute_audio_attributes(
     audio_path: str,
     frame_length: int = 400,
     hop_length: int = 160,
     silence_threshold_db: float = -40.0,
     noise_percentile: float = 20.0,
+    bw_energy_threshold: float = 0.01,
+    vad_flatness_threshold: float = 0.3,
+    rt60_decay_db: float = 20.0,
 ) -> Dict[str, Any]:
     """
-    Compute standardized acoustic attributes for one audio file.
+    Compute standardized acoustic quality attributes for one audio file.
 
     Parameters
     ----------
@@ -390,17 +607,54 @@ def compute_audio_attributes(
         Relative silence threshold in dB, by default -40.0.
     noise_percentile : float, optional
         Percentile used to estimate the noise floor for SNR, by default 20.0.
+    bw_energy_threshold : float, optional
+        Spectral energy fraction used for bandwidth estimation, by default 0.01.
+    vad_flatness_threshold : float, optional
+        Spectral-flatness ceiling for VAD speech detection, by default 0.3.
+    rt60_decay_db : float, optional
+        dB decay used in the RT60 Schroeder estimate, by default 20.0.
 
     Returns
     -------
     Dict[str, Any]
-        Dictionary containing computed attributes.
+        Dictionary containing all computed attributes.
+
+    Attributes returned
+    -------------------
+    sample_rate, num_samples, duration_sec
+        Basic file properties.
+    rms, peak_abs
+        Overall signal level (linear amplitude).
+    rms_dbfs, peak_dbfs
+        RMS and peak level in dBFS (20·log10 of the linear value).
+    crest_factor_db
+        Peak-to-RMS ratio in dB (10–20 dB is healthy speech).
+    silence_ratio
+        Fraction of energy-silent frames.
+    vad_speech_ratio
+        Fraction of frames containing speech (energy + spectral flatness).
+    snr_db_est
+        Heuristic SNR estimate in dB.
+    clipping_ratio
+        Fraction of samples at or near full-scale.
+    spectral_flatness
+        Mean spectral flatness (0 = tonal, 1 = noise-like).
+    zero_crossing_rate
+        Mean zero-crossing rate (crossings per sample).
+    effective_bandwidth_hz
+        Highest frequency with significant spectral energy.
+    rt60_est_sec
+        Rough reverberation time estimate in seconds.
+    num_channels, channel_strategy, channel_rms_diff, dominant_channel
+        Channel diagnostics.
     """
     waveform, sample_rate, channel_info = load_audio_mono(audio_path)
 
     duration_sec = len(waveform) / sample_rate if sample_rate > 0 else float("nan")
     rms = compute_rms(waveform)
     peak_abs = float(np.max(np.abs(waveform))) if waveform.size > 0 else float("nan")
+    rms_dbfs = float(20.0 * safe_log10(rms))
+    peak_dbfs = float(20.0 * safe_log10(peak_abs))
 
     frame_rms = compute_frame_rms(
         waveform=waveform,
@@ -412,90 +666,77 @@ def compute_audio_attributes(
         frame_rms=frame_rms,
         silence_threshold_db=silence_threshold_db,
     )
-
     snr_db_est = estimate_snr_db(
         frame_rms=frame_rms,
         noise_percentile=noise_percentile,
     )
-
-    clipping_ratio    = compute_clipping_ratio(waveform)
+    clipping_ratio = compute_clipping_ratio(waveform)
     spectral_flatness = compute_spectral_flatness(waveform)
+    zero_crossing_rate = compute_zero_crossing_rate(waveform)
+    crest_factor_db = compute_crest_factor_db(rms, peak_abs)
+    effective_bandwidth_hz = compute_effective_bandwidth_hz(
+        waveform=waveform,
+        sample_rate=sample_rate,
+        energy_threshold=bw_energy_threshold,
+    )
+    vad_speech_ratio = compute_vad_speech_ratio(
+        waveform=waveform,
+        sample_rate=sample_rate,
+        frame_length=frame_length,
+        hop_length=hop_length,
+        energy_threshold_db=silence_threshold_db,
+        flatness_threshold=vad_flatness_threshold,
+    )
+    rt60_est_sec = estimate_rt60(
+        waveform=waveform,
+        sample_rate=sample_rate,
+        decay_db=rt60_decay_db,
+    )
 
     return {
-        "sample_rate":       sample_rate,
-        "num_samples":       int(len(waveform)),
-        "duration_sec":      float(duration_sec),
-        "rms":               rms,
-        "peak_abs":          peak_abs,
-        "silence_ratio":     silence_ratio,
-        "snr_db_est":        snr_db_est,
-        "clipping_ratio":    clipping_ratio,
-        "spectral_flatness": spectral_flatness,
-        "num_channels":      channel_info["num_channels"],
-        "channel_strategy":  channel_info["channel_strategy"],
-        "channel_rms_diff":  channel_info["channel_rms_diff"],
-        "dominant_channel":  channel_info["dominant_channel"],
+        # Basic properties
+        "sample_rate":            sample_rate,
+        "num_samples":            int(len(waveform)),
+        "duration_sec":           float(duration_sec),
+        # Signal level
+        "rms":                    rms,
+        "peak_abs":               peak_abs,
+        "rms_dbfs":               rms_dbfs,
+        "peak_dbfs":              peak_dbfs,
+        "crest_factor_db":        crest_factor_db,
+        # Activity
+        "silence_ratio":          silence_ratio,
+        "vad_speech_ratio":       vad_speech_ratio,
+        # Noise / quality
+        "snr_db_est":             snr_db_est,
+        "clipping_ratio":         clipping_ratio,
+        # Spectral character
+        "spectral_flatness":      spectral_flatness,
+        "zero_crossing_rate":     zero_crossing_rate,
+        "effective_bandwidth_hz": effective_bandwidth_hz,
+        # Reverberation
+        "rt60_est_sec":           rt60_est_sec,
+        # Channel info
+        "num_channels":           channel_info["num_channels"],
+        "channel_strategy":       channel_info["channel_strategy"],
+        "channel_rms_diff":       channel_info["channel_rms_diff"],
+        "dominant_channel":       channel_info["dominant_channel"],
     }
-
-
-def compute_quality_metrics_for_manifest(
-    manifest_csv: str | Path,
-    audio_dir: str | Path,
-    audio_col: str = "audio_filename",
-    output_csv: Optional[str | Path] = None,
-) -> pd.DataFrame:
-    """
-    Compute audio quality metrics for every file listed in a manifest CSV.
-
-    Calls `compute_audio_attributes` on each file and merges the results back
-    into the original manifest as additional columns.
-
-    Parameters
-    ----------
-    manifest_csv : str or Path
-        Path to the CSV manifest file.
-    audio_dir : str or Path
-        Directory containing the audio files.
-    audio_col : str, optional
-        Column in the manifest containing audio filenames, by default 'audio_filename'.
-    output_csv : str or Path, optional
-        If provided, saves the enriched DataFrame to this path.
-
-    Returns
-    -------
-    pd.DataFrame
-        Original manifest with quality metric columns appended.
-    """
-    audio_dir = Path(audio_dir)
-    df = pd.read_csv(manifest_csv)
-    records = []
-
-    for fname in tqdm(df[audio_col], desc="Computing audio quality metrics"):
-        audio_path = audio_dir / fname
-        try:
-            attrs = compute_audio_attributes(str(audio_path))
-        except Exception as e:
-            attrs = {k: float("nan") for k in [
-                "sample_rate", "num_samples", "duration_sec", "rms", "peak_abs",
-                "silence_ratio", "snr_db_est", "clipping_ratio", "spectral_flatness",
-                "num_channels", "channel_strategy", "channel_rms_diff", "dominant_channel",
-            ]}
-            print(f"  Warning: could not process {fname}: {e}")
-        records.append(attrs)
-
-    metrics_df = pd.DataFrame(records)
-    result = pd.concat([df.reset_index(drop=True), metrics_df], axis=1)
-
-    if output_csv is not None:
-        result.to_csv(output_csv, index=False)
-        print(f"Saved to {output_csv}")
-
-    return result
 
 
 def load_audio_16k_mono(audio_path: str) -> tuple[np.ndarray, int]:
     """
-    Load audio, convert to mono, resample to 16 kHz.
+    Load audio, convert to mono, and resample to 16 kHz.
+
+    Parameters
+    ----------
+    audio_path : str
+        Path to the audio file.
+
+    Returns
+    -------
+    tuple[np.ndarray, int]
+        Mono float32 waveform and sample rate (always 16000).
     """
     waveform, sr = sf.read(audio_path, always_2d=False)
 
@@ -513,8 +754,19 @@ def load_audio_16k_mono(audio_path: str) -> tuple[np.ndarray, int]:
 
 def write_temp_wav_16k(audio_path: str) -> str:
     """
-    Convert audio to temporary 16k mono WAV and return temp path.
-    Useful for API calls.
+    Convert audio to a temporary 16 kHz mono WAV file and return the path.
+
+    The caller is responsible for deleting the temporary file when done.
+
+    Parameters
+    ----------
+    audio_path : str
+        Path to the source audio file.
+
+    Returns
+    -------
+    str
+        Path to the temporary WAV file.
     """
     waveform, sr = load_audio_16k_mono(audio_path)
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
@@ -522,40 +774,3 @@ def write_temp_wav_16k(audio_path: str) -> str:
     tmp.close()
     sf.write(tmp_path, waveform, sr)
     return tmp_path
-
-
-class HFASRBackend:
-    """
-    Generic Hugging Face ASR backend using pipeline().
-    Works for Whisper, wav2vec2, MMS, and many ASR-capable checkpoints.
-    """
-
-    def __init__(
-        self,
-        model_id: str,
-        device: str = "cpu",
-        torch_dtype: Optional[str] = None,
-        chunk_length_s: Optional[int] = None,
-        batch_size: int = 1,
-        language: Optional[str] = None,
-        generate_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        self.model_id = model_id
-        self.device = 0 if device == "cuda" and torch.cuda.is_available() else -1
-        self.batch_size = batch_size
-        self.chunk_length_s = chunk_length_s
-        self.language = language
-        self.generate_kwargs = generate_kwargs or {}
-
-        dtype = None
-        if torch_dtype == "float16":
-            dtype = torch.float16
-        elif torch_dtype == "bfloat16":
-            dtype = torch.bfloat16
-
-        self.pipe = pipeline(
-            task="automatic-speech-recognition",
-            model=model_id,
-            device=self.device,
-            torch_dtype=dtype,
-        )
