@@ -10,8 +10,9 @@ from IPython.display import display, HTML
 from tqdm import tqdm
 
 from datasets import Dataset, DatasetDict, Audio
-from data_utils.audio_utils import compute_audio_attributes
-from data_utils.text_utils import (
+from .audio_utils import compute_audio_attributes, load_audio_mono
+from .vad_utils import compute_vad_metrics
+from .text_utils import (
     normalize_transcript,
     count_words,
     count_chars,
@@ -289,15 +290,15 @@ def extract_all_chars(batch, transcript_column="sentence"):
     return {"vocab": [vocab], "all_text": [all_text]}
 
 def compute_quality_metrics_for_manifest(
-    manifest_csv: str | Path,
+    manifest: pd.DataFrame | str | Path,
     audio_dir: str | Path,
     audio_col: str = "audio_filename",
     transcript_col: Optional[str] = None,
-    use_vad: bool = False,
+    use_vad: bool = True,
     output_csv: Optional[str | Path] = None,
 ) -> pd.DataFrame:
     """
-    Compute audio quality metrics for every file listed in a manifest CSV.
+    Compute audio quality metrics for every file listed in a manifest.
 
     Calls :func:`~data_utils.audio_utils.compute_audio_attributes` on each
     file and merges the results back into the original manifest as additional
@@ -306,8 +307,9 @@ def compute_quality_metrics_for_manifest(
 
     Parameters
     ----------
-    manifest_csv : str or Path
-        Path to the CSV manifest file.
+    manifest : pd.DataFrame or str or Path
+        Either a DataFrame already loaded into memory, or a path to a CSV
+        file which will be read with ``pd.read_csv``.
     audio_dir : str or Path
         Directory containing the audio files.
     audio_col : str, optional
@@ -331,10 +333,8 @@ def compute_quality_metrics_for_manifest(
     pd.DataFrame
         Original manifest with quality metric columns appended.
     """
-    from data_utils.audio_utils import load_audio_mono
-
     audio_dir = Path(audio_dir)
-    df = pd.read_csv(manifest_csv)
+    df = manifest.copy() if isinstance(manifest, pd.DataFrame) else pd.read_csv(manifest)
 
     _audio_nan: Dict[str, Any] = {k: float("nan") for k in [
         "sample_rate", "num_samples", "duration_sec",
@@ -374,7 +374,6 @@ def compute_quality_metrics_for_manifest(
         # ── VAD metrics (optional) ────────────────────────────────────────
         if use_vad:
             try:
-                from data_utils.vad_utils import compute_vad_metrics
                 waveform, sr, _ = load_audio_mono(str(audio_path))
                 vad_attrs = compute_vad_metrics(waveform, sr)
             except Exception as e:
@@ -385,8 +384,7 @@ def compute_quality_metrics_for_manifest(
         # ── transcript metrics (optional) ─────────────────────────────────
         if has_transcripts:
             try:
-                raw_text = str(df[transcript_col].iloc[i]) if pd.notna(df[transcript_col].iloc[i]) else ""
-                norm_text = normalize_transcript(raw_text)
+                norm_text = str(df[transcript_col].iloc[i]) if pd.notna(df[transcript_col].iloc[i]) else ""
                 dur = attrs.get("duration_sec", float("nan"))
                 tx_records.append({
                     "num_words":        count_words(norm_text),
@@ -412,7 +410,6 @@ def compute_quality_metrics_for_manifest(
         print(f"Saved to {output_csv}")
 
     return result
-
 
 def compute_bad_quality_score(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -450,7 +447,7 @@ def compute_bad_quality_score(df: pd.DataFrame) -> pd.DataFrame:
 
     # duration
     if "duration_sec" in df.columns:
-        df["flag_duration"] = ~df["duration_sec"].between(0.7, 25.0)
+        df["flag_duration"] = ~df["duration_sec"].between(0.5, 30.0)
     else:
         df["flag_duration"] = False
 
@@ -506,7 +503,6 @@ def compute_bad_quality_score(df: pd.DataFrame) -> pd.DataFrame:
     df["bad_quality_score"] = df[flag_cols].sum(axis=1).astype(int)
 
     return df
-
 
 def create_data_variants(
     df: pd.DataFrame,
@@ -566,7 +562,6 @@ def create_data_variants(
     if "duration_sec" in variant_b.columns:
         strong_reject |= ~variant_b["duration_sec"].between(0.5, 30.0)
 
-    # prefer VAD speech_ratio, fall back to heuristic
     sr_col = "speech_ratio" if "speech_ratio" in variant_b.columns else "vad_speech_ratio"
     if sr_col in variant_b.columns:
         strong_reject |= variant_b[sr_col] < 0.20
@@ -576,6 +571,10 @@ def create_data_variants(
 
     if "clipping_ratio" in variant_b.columns:
         strong_reject |= variant_b["clipping_ratio"] > 0.02
+
+    # snr_proxy_db is only reliable when Silero VAD ran; skip heuristic snr_db_est
+    if "snr_proxy_db" in variant_b.columns:
+        strong_reject |= variant_b["snr_proxy_db"] < 0.0
 
     variant_c = variant_b[~strong_reject].reset_index(drop=True)
 

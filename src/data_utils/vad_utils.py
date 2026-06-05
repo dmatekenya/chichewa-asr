@@ -24,11 +24,12 @@ import functools
 import math
 from typing import Any, Dict, List
 
+import librosa
 import numpy as np
+import torch
 
-# ---------------------------------------------------------------------------
-# Silero model loader — cached per process
-# ---------------------------------------------------------------------------
+from .audio_utils import compute_vad_speech_ratio
+
 
 @functools.lru_cache(maxsize=1)
 def _load_silero_model():
@@ -42,22 +43,17 @@ def _load_silero_model():
         or (None, None) if the package is not available.
     """
     try:
-        import torch
         model, utils = torch.hub.load(
             repo_or_dir="snakers4/silero-vad",
             model="silero_vad",
             force_reload=False,
             verbose=False,
+            trust_repo=True,
         )
-        get_speech_timestamps = utils[0]
-        return model, get_speech_timestamps
+        return model, utils[0]
     except Exception:
         return None, None
 
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 def _rms(samples: np.ndarray) -> float:
     if samples.size == 0:
@@ -70,8 +66,7 @@ def _safe_log10(x: float, eps: float = 1e-12) -> float:
 
 
 def _resample_to_16k(waveform: np.ndarray, sample_rate: int) -> np.ndarray:
-    """Resample waveform to 16 kHz mono float32 using librosa."""
-    import librosa
+    """Resample waveform to 16 kHz mono float32."""
     if waveform.ndim == 2:
         waveform = waveform.mean(axis=1)
     waveform = waveform.astype(np.float32)
@@ -79,10 +74,6 @@ def _resample_to_16k(waveform: np.ndarray, sample_rate: int) -> np.ndarray:
         waveform = librosa.resample(waveform, orig_sr=sample_rate, target_sr=16000)
     return waveform
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def compute_vad_segments(
     waveform: np.ndarray,
@@ -116,8 +107,6 @@ def compute_vad_segments(
     model, get_speech_timestamps = _load_silero_model()
     if model is None:
         return []
-
-    import torch
 
     wav16k = _resample_to_16k(waveform, sample_rate)
     wav_tensor = torch.from_numpy(wav16k)
@@ -191,18 +180,10 @@ def compute_vad_metrics(
     model, _ = _load_silero_model()
     silero_available = model is not None
 
-    # Mono float32 at original sample rate for RMS computation
-    if waveform.ndim == 2:
-        mono = waveform.mean(axis=1).astype(np.float32)
-    else:
-        mono = waveform.astype(np.float32)
-
+    mono = waveform.mean(axis=1).astype(np.float32) if waveform.ndim == 2 else waveform.astype(np.float32)
     total_samples = len(mono)
     total_duration = total_samples / sample_rate if sample_rate > 0 else float("nan")
 
-    # ------------------------------------------------------------------
-    # Silero path
-    # ------------------------------------------------------------------
     if silero_available:
         segments = compute_vad_segments(
             waveform=waveform,
@@ -214,51 +195,32 @@ def compute_vad_metrics(
 
         speech_duration = sum(s["duration_sec"] for s in segments)
         num_segments = len(segments)
-        mean_seg_dur = (
-            speech_duration / num_segments if num_segments > 0 else float("nan")
+        mean_seg_dur = speech_duration / num_segments if num_segments > 0 else float("nan")
+        speech_ratio = min(
+            speech_duration / total_duration if total_duration and total_duration > 0 else float("nan"),
+            1.0,
         )
-        speech_ratio = (
-            speech_duration / total_duration
-            if total_duration and total_duration > 0
-            else float("nan")
-        )
-        speech_ratio = min(speech_ratio, 1.0)  # clip floating-point overshoot
 
-        # Build boolean mask of speech samples for SNR proxy
         speech_mask = np.zeros(total_samples, dtype=bool)
         for seg in segments:
-            start_idx = int(seg["start_sec"] * sample_rate)
-            end_idx   = int(seg["end_sec"]   * sample_rate)
-            start_idx = max(0, min(start_idx, total_samples))
-            end_idx   = max(0, min(end_idx,   total_samples))
+            start_idx = max(0, min(int(seg["start_sec"] * sample_rate), total_samples))
+            end_idx   = max(0, min(int(seg["end_sec"]   * sample_rate), total_samples))
             speech_mask[start_idx:end_idx] = True
 
-        speech_samples    = mono[speech_mask]
+        speech_samples     = mono[speech_mask]
         non_speech_samples = mono[~speech_mask]
-
-        rms_speech     = _rms(speech_samples)
-        rms_non_speech = _rms(non_speech_samples)
-
         snr_proxy = (
-            20.0 * _safe_log10(rms_speech) - 20.0 * _safe_log10(rms_non_speech)
+            20.0 * _safe_log10(_rms(speech_samples)) - 20.0 * _safe_log10(_rms(non_speech_samples))
             if speech_samples.size > 0 and non_speech_samples.size > 0
             else float("nan")
         )
 
-    # ------------------------------------------------------------------
-    # Fallback path (no Silero)
-    # ------------------------------------------------------------------
     else:
-        from data_utils.audio_utils import compute_vad_speech_ratio
-
-        speech_ratio = compute_vad_speech_ratio(
-            waveform=mono,
-            sample_rate=sample_rate,
-        )
-        speech_duration   = speech_ratio * total_duration if not math.isnan(speech_ratio) else float("nan")
-        num_segments      = float("nan")
-        mean_seg_dur      = float("nan")
-        snr_proxy         = float("nan")
+        speech_ratio    = compute_vad_speech_ratio(waveform=mono, sample_rate=sample_rate)
+        speech_duration = speech_ratio * total_duration if not math.isnan(speech_ratio) else float("nan")
+        num_segments    = float("nan")
+        mean_seg_dur    = float("nan")
+        snr_proxy       = float("nan")
 
     silence_ratio = 1.0 - speech_ratio if not math.isnan(speech_ratio) else float("nan")
 
